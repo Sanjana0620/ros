@@ -1,115 +1,6 @@
-# ex4_cleaning_server
+# cleaning_client
 
-import rclpy
-import time
-
-from rclpy.node import Node
-from rclpy.action import (
-    ActionServer,
-    CancelResponse,
-    GoalResponse
-)
-
-from custom_interfaces.action import CleaningTask
-
-class CleaningServer(Node):
-
-    def __init__(self):
-        super().__init__('cleaning_server')
-
-        ActionServer(
-            self,
-            CleaningTask,
-            'cleaning_task',
-            execute_callback=self.execute_goal,
-            goal_callback=self.goal_cb,
-            cancel_callback=self.cancel_cb
-        )
-
-        self.get_logger().info(
-            'Cleaning Task Server ready.'
-        )
-
-    def goal_cb(self, goal_request):
-
-        self.get_logger().info(
-            'Goal received — accepting.'
-        )
-
-        return GoalResponse.ACCEPT
-
-    def cancel_cb(self, goal_handle):
-
-        self.get_logger().info(
-            'Cancel request received — accepting.'
-        )
-
-        return CancelResponse.ACCEPT
-
-    def execute_goal(self, goal_handle):
-
-        steps = goal_handle.request.total_steps
-
-        fb = CleaningTask.Feedback()
-
-        progress = 0
-
-        for step in range(1, steps + 1):
-
-            if goal_handle.is_cancel_requested:
-
-                goal_handle.canceled()
-
-                result = CleaningTask.Result()
-
-                result.final_progress = progress
-
-                result.outcome = (
-                    f'CANCELLED at {progress}%'
-                )
-
-                self.get_logger().info(
-                    result.outcome
-                )
-
-                return result
-
-            time.sleep(0.6)
-
-            progress = step * (100 // steps)
-
-            fb.progress_percent = progress
-
-            goal_handle.publish_feedback(fb)
-
-            self.get_logger().info(
-                f'Progress: {progress}%'
-            )
-
-        goal_handle.succeed()
-
-        result = CleaningTask.Result()
-
-        result.final_progress = 100
-        result.outcome = 'COMPLETED'
-
-        return result
-
-
-def main():
-    rclpy.init()
-
-    rclpy.spin(CleaningServer())
-
-    rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
-
-
-
-# ex4_cleaning_client
+#!/usr/bin/env python3
 
 import rclpy
 
@@ -117,97 +8,208 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from custom_interfaces.action import CleaningTask
 
+
 class CleaningClient(Node):
 
     def __init__(self):
+
         super().__init__('cleaning_client')
 
-        self._client = ActionClient(
+        self.cancel_sent = False
+
+        self.client = ActionClient(
             self,
             CleaningTask,
             'cleaning_task'
         )
 
-        self._gh = None
+        self.get_logger().info(
+            'Client Ready! Waiting for Server!'
+        )
 
-        self._client.wait_for_server()
+        self.client.wait_for_server()
+
+        self.get_logger().info(
+            'Server Found!'
+        )
 
         goal = CleaningTask.Goal()
 
         goal.total_steps = 10
 
-        self.get_logger().info(
-            'Sending cleaning goal (10 steps).'
-        )
-
-        future = self._client.send_goal_async(
+        future = self.client.send_goal_async(
             goal,
-            feedback_callback=self.on_feedback
+            feedback_callback=self.feedback_cb
         )
 
-        future.add_done_callback(
-            self.goal_response_cb
+        rclpy.spin_until_future_complete(
+            self,
+            future
         )
 
-    def goal_response_cb(self, future):
+        self.response = future.result()
 
-        self._gh = future.result()
+        result_future = self.response.get_result_async()
 
-        if not self._gh.accepted:
+        rclpy.spin_until_future_complete(
+            self,
+            result_future
+        )
+
+        result = result_future.result().result
+
+        self.get_logger().info(
+            f'Final Progress: {result.final_progress}%'
+        )
+
+        self.get_logger().info(
+            f'Outcome: {result.outcome}'
+        )
+
+    def feedback_cb(self, fb):
+
+        progress = fb.feedback.progress_percent
+
+        self.get_logger().info(
+            f'Progress: {progress}%'
+        )
+
+        if progress > 50 and not self.cancel_sent:
+
+            self.cancel_sent = True
 
             self.get_logger().info(
-                'Goal rejected!'
+                'Canceling Task...'
             )
 
-            return
-
-        self.get_logger().info(
-            'Goal accepted.'
-        )
-
-        result_future = self._gh.get_result_async()
-
-        result_future.add_done_callback(
-            self.result_cb
-        )
-
-    def on_feedback(self, msg):
-
-        pct = msg.feedback.progress_percent
-
-        self.get_logger().info(
-            f'Cleaning progress: {pct}%'
-        )
-
-        if pct > 50 and self._gh is not None:
-
-            self.get_logger().info(
-                '> 50% — cancelling goal!'
-            )
-
-            self._gh.cancel_goal_async()
-
-            self._gh = None
-
-    def result_cb(self, future):
-
-        res = future.result().result
-
-        self.get_logger().info(
-            f'Final result: {res.outcome} '
-            f'(progress = {res.final_progress}%)'
-        )
+            self.response.cancel_goal_async()
 
 
-def main():
-    rclpy.init()
+def main(args=None):
 
-    node = CleaningClient()
+    rclpy.init(args=args)
 
-    rclpy.spin(node)
+    CleaningClient()
 
     rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
+
+
+
+# cleaning_server
+
+#!/usr/bin/env python3
+
+import rclpy
+import time
+
+from rclpy.node import Node
+from rclpy.action import (
+    ActionServer,
+    CancelResponse
+)
+
+from rclpy.executors import MultiThreadedExecutor
+
+from custom_interfaces.action import CleaningTask
+
+
+class CleaningServer(Node):
+
+    def __init__(self):
+
+        super().__init__('cleaning_server')
+
+        self.server = ActionServer(
+            self,
+            CleaningTask,
+            'cleaning_task',
+            self.cb,
+            cancel_callback=self.cancel_cb
+        )
+
+        self.get_logger().info(
+            'Cleaning Server Ready'
+        )
+
+    def cancel_cb(self, goal):
+
+        self.get_logger().info(
+            'Cancel Request Accepted'
+        )
+
+        return CancelResponse.ACCEPT
+
+    def cb(self, goal):
+
+        total = goal.request.total_steps
+
+        feedback = CleaningTask.Feedback()
+
+        for step in range(1, total + 1):
+
+            time.sleep(1)
+
+            progress = int((step / total) * 100)
+
+            if goal.is_cancel_requested:
+
+                self.get_logger().info(
+                    'Cleaning Task Canceled'
+                )
+
+                goal.canceled()
+
+                result = CleaningTask.Result()
+
+                result.final_progress = progress
+
+                result.outcome = 'CANCELED'
+
+                return result
+
+            feedback.progress_percent = progress
+
+            goal.publish_feedback(feedback)
+
+            self.get_logger().info(
+                f'Cleaning Progress: {progress}%'
+            )
+
+        goal.succeed()
+
+        self.get_logger().info(
+            'Cleaning Completed'
+        )
+
+        result = CleaningTask.Result()
+
+        result.final_progress = 100
+
+        result.outcome = 'COMPLETED'
+
+        return result
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = CleaningServer()
+
+    executor = MultiThreadedExecutor()
+
+    executor.add_node(node)
+
+    executor.spin()
+
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+
